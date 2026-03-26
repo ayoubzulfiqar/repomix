@@ -5,20 +5,23 @@ on:
     types:
       - created
 
+permissions:
+  contents: read
+
 jobs:
   homebrew:
     runs-on: macos-latest
     steps:
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@main
+        uses: Homebrew/actions/setup-homebrew@42435f26fd0824180d7a31f0dd75afd37eb2e18f # main
         with:
           test-bot: false
 
       - name: Configure Git user
-        uses: Homebrew/actions/git-user-config@main
+        uses: Homebrew/actions/git-user-config@42435f26fd0824180d7a31f0dd75afd37eb2e18f # main
 
       - name: Bump packages
-        uses: Homebrew/actions/bump-packages@main
+        uses: Homebrew/actions/bump-packages@42435f26fd0824180d7a31f0dd75afd37eb2e18f # main
         with:
           token: ${{ secrets.COMMITTER_TOKEN }}
           formulae: repomix
