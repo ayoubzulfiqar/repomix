@@ -1,13 +1,24 @@
 import { describe, expect, it, type Mock, vi } from 'vitest';
 import type { ProcessedFile } from '../../../src/core/file/fileTypes.js';
 import type { GitDiffResult } from '../../../src/core/git/gitDiffHandle.js';
-import { calculateMetrics } from '../../../src/core/metrics/calculateMetrics.js';
-import { calculateSelectiveFileMetrics } from '../../../src/core/metrics/calculateSelectiveFileMetrics.js';
+import { calculateFileMetrics } from '../../../src/core/metrics/calculateFileMetrics.js';
+import { calculateMetrics, createMetricsTaskRunner } from '../../../src/core/metrics/calculateMetrics.js';
 import type { RepomixProgressCallback } from '../../../src/shared/types.js';
 import { createMockConfig } from '../../testing/testUtils.js';
 
+vi.mock('../../../src/shared/processConcurrency.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../../src/shared/processConcurrency.js')>();
+  return {
+    ...original,
+    initTaskRunner: vi.fn(() => ({
+      run: vi.fn().mockResolvedValue(0),
+      cleanup: vi.fn().mockResolvedValue(undefined),
+    })),
+  };
+});
 vi.mock('../../../src/core/metrics/TokenCounter.js', () => {
   return {
+    TOKEN_ENCODINGS: ['o200k_base', 'cl100k_base', 'p50k_base', 'p50k_edit', 'r50k_base'],
     TokenCounter: vi.fn().mockImplementation(() => ({
       countTokens: vi.fn().mockReturnValue(10),
       free: vi.fn(),
@@ -15,8 +26,8 @@ vi.mock('../../../src/core/metrics/TokenCounter.js', () => {
   };
 });
 vi.mock('../../../src/core/metrics/aggregateMetrics.js');
-vi.mock('../../../src/core/metrics/calculateSelectiveFileMetrics.js', () => ({
-  calculateSelectiveFileMetrics: vi.fn(),
+vi.mock('../../../src/core/metrics/calculateFileMetrics.js', () => ({
+  calculateFileMetrics: vi.fn(),
 }));
 
 describe('calculateMetrics', () => {
@@ -32,7 +43,7 @@ describe('calculateMetrics', () => {
       { path: 'file1.txt', charCount: 100, tokenCount: 10 },
       { path: 'file2.txt', charCount: 200, tokenCount: 20 },
     ];
-    (calculateSelectiveFileMetrics as unknown as Mock).mockResolvedValue(fileMetrics);
+    (calculateFileMetrics as unknown as Mock).mockResolvedValue(fileMetrics);
 
     const aggregatedResult = {
       totalFiles: 2,
@@ -50,7 +61,7 @@ describe('calculateMetrics', () => {
       gitLogTokenCount: 0,
     };
 
-    const config = createMockConfig();
+    const config = createMockConfig({ output: { parsableStyle: true } });
 
     const gitDiffResult: GitDiffResult | undefined = undefined;
 
@@ -59,18 +70,26 @@ describe('calculateMetrics', () => {
       cleanup: vi.fn(),
     };
 
-    const result = await calculateMetrics(processedFiles, output, progressCallback, config, gitDiffResult, undefined, {
-      calculateSelectiveFileMetrics,
-      calculateOutputMetrics: async () => 30,
-      calculateGitDiffMetrics: () => Promise.resolve(0),
-      calculateGitLogMetrics: () => Promise.resolve({ gitLogTokenCount: 0 }),
-      taskRunner: mockTaskRunner,
-    });
+    const result = await calculateMetrics(
+      processedFiles,
+      Promise.resolve(output),
+      progressCallback,
+      config,
+      gitDiffResult,
+      undefined,
+      {
+        calculateFileMetrics,
+        calculateOutputMetrics: async () => 30,
+        calculateGitDiffMetrics: () => Promise.resolve(0),
+        calculateGitLogMetrics: () => Promise.resolve({ gitLogTokenCount: 0 }),
+        taskRunner: mockTaskRunner,
+      },
+    );
 
     expect(progressCallback).toHaveBeenCalledWith('Calculating metrics...');
-    expect(calculateSelectiveFileMetrics).toHaveBeenCalledWith(
+    expect(calculateFileMetrics).toHaveBeenCalledWith(
       processedFiles,
-      ['file2.txt', 'file1.txt'], // sorted by character count desc
+      ['file1.txt', 'file2.txt'],
       'o200k_base',
       progressCallback,
       expect.objectContaining({
@@ -78,5 +97,42 @@ describe('calculateMetrics', () => {
       }),
     );
     expect(result).toEqual(aggregatedResult);
+  });
+});
+
+describe('createMetricsTaskRunner', () => {
+  it('should return a taskRunner and warmupPromise', async () => {
+    const result = createMetricsTaskRunner(100, 'o200k_base');
+
+    expect(result).toHaveProperty('taskRunner');
+    expect(result).toHaveProperty('warmupPromise');
+    expect(result.taskRunner).toHaveProperty('run');
+    expect(result.taskRunner).toHaveProperty('cleanup');
+
+    // warmupPromise should resolve without error
+    await expect(result.warmupPromise).resolves.toBeDefined();
+  });
+
+  it('should fire a warmup task with empty content', async () => {
+    const result = createMetricsTaskRunner(50, 'cl100k_base');
+
+    await result.warmupPromise;
+
+    expect(result.taskRunner.run).toHaveBeenCalledWith({ content: '', encoding: 'cl100k_base' });
+  });
+
+  it('should swallow warmup task errors', async () => {
+    const { initTaskRunner } = await import('../../../src/shared/processConcurrency.js');
+    (initTaskRunner as Mock).mockReturnValueOnce({
+      run: vi.fn().mockRejectedValue(new Error('init failed')),
+      cleanup: vi.fn(),
+    });
+
+    const result = createMetricsTaskRunner(10, 'o200k_base');
+
+    // warmupPromise should resolve (errors swallowed by .catch on each task)
+    const resolved = await result.warmupPromise;
+    expect(Array.isArray(resolved)).toBe(true);
+    expect((resolved as number[]).every((v) => v === 0)).toBe(true);
   });
 });

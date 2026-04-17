@@ -50,9 +50,8 @@ const getFileChangeCounts = async (
     const fileChangeCounts = await deps.getFileChangeCount(cwd, maxCommits);
     fileChangeCountsCache.set(cacheKey, fileChangeCounts);
 
-    const sortedFileChangeCounts = Object.entries(fileChangeCounts).sort((a, b) => b[1] - a[1]);
     logger.trace('Git File change counts max commits:', maxCommits);
-    logger.trace('Git File change counts:', sortedFileChangeCounts);
+    logger.trace('Git File change counts:', fileChangeCounts);
 
     return fileChangeCounts;
   } catch {
@@ -112,6 +111,22 @@ export const sortOutputFiles = async (
   }
 
   return sortFilesByChangeCounts(files, fileChangeCounts);
+};
+
+/**
+ * Pre-fetch git file change counts so that a later `sortOutputFiles` call
+ * hits the in-memory cache instead of spawning git subprocesses on the
+ * critical path.
+ */
+export const prefetchSortData = async (
+  config: RepomixConfigMerged,
+  deps: SortDeps = {
+    getFileChangeCount,
+    isGitInstalled,
+  },
+): Promise<void> => {
+  if (!config.output.git?.sortByChanges) return;
+  await getFileChangeCounts(config.cwd, config.output.git?.sortByChangesMaxCommits, deps);
 };
 
 const sortFilesByChangeCounts = (files: ProcessedFile[], fileChangeCounts: Record<string, number>): ProcessedFile[] => {

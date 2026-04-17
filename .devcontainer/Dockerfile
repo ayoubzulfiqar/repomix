@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   vim \
   fd-find \
   ripgrep \
+  hyperfine \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create symlink for fd (Debian/Ubuntu names it fdfind)
@@ -77,8 +78,8 @@ ENV PATH=$PATH:/home/node/.local/bin
 ENV SHELL=/bin/zsh
 
 # Set the default editor and visual
-ENV EDITOR=nano
-ENV VISUAL=nano
+ENV EDITOR=vim
+ENV VISUAL=vim
 
 # Default powerline10k theme
 ARG ZSH_IN_DOCKER_VERSION=1.2.0
