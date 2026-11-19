@@ -1,10 +1,9 @@
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mergeConfigs } from '../../../src/config/configLoad.js';
-import type { RepomixConfigFile, RepomixConfigMerged, RepomixOutputStyle } from '../../../src/config/configSchema.js';
+import { beforeEach, describe, expect, it } from 'vitest';
+import type { RepomixConfigMerged } from '../../../src/config/configSchema.js';
 import { collectFiles } from '../../../src/core/file/fileCollect.js';
+import { resolveFileLevel } from '../../../src/core/file/fileLevelResolve.js';
 import { readRawFile } from '../../../src/core/file/fileRead.js';
 import { searchFiles } from '../../../src/core/file/fileSearch.js';
 import type { ProcessedFile } from '../../../src/core/file/fileTypes.js';
@@ -13,6 +12,9 @@ import { produceOutput } from '../../../src/core/packager/produceOutput.js';
 import { pack } from '../../../src/core/packager.js';
 import { filterOutUntrustedFiles } from '../../../src/core/security/filterOutUntrustedFiles.js';
 import { validateFileSafety } from '../../../src/core/security/validateFileSafety.js';
+import { buildPackSpecConfig } from '../../testing/packSpecConfig.js';
+import { createMetricsTaskRunnerDouble } from '../../testing/taskRunnerDoubles.js';
+import { createTempDir } from '../../testing/tempDir.js';
 
 // Behavior-level regression tests for multi-root packing.
 //
@@ -38,20 +40,6 @@ import { validateFileSafety } from '../../../src/core/security/validateFileSafet
 //   bodies reach the files section — see tests around
 //   `generateTreeStringWithRoots` for tree-only guarantees.
 
-const buildMergedConfig = (
-  cwd: string,
-  outputFilePath: string,
-  style: RepomixOutputStyle,
-  overrides: Partial<RepomixConfigFile> = {},
-): RepomixConfigMerged =>
-  mergeConfigs(cwd, overrides, {
-    output: {
-      filePath: outputFilePath,
-      style,
-      git: { sortByChanges: false, includeDiffs: false, includeLogs: false },
-    },
-  });
-
 const runPack = (rootDirs: string[], config: RepomixConfigMerged) =>
   pack(rootDirs, config, () => {}, {
     searchFiles,
@@ -61,7 +49,8 @@ const runPack = (rootDirs: string[], config: RepomixConfigMerged) =>
     processFiles: async (rawFiles, cfg) => {
       const processedFiles: ProcessedFile[] = [];
       for (const rawFile of rawFiles) {
-        processedFiles.push(await fileProcessWorker({ rawFile, config: cfg }));
+        const level = resolveFileLevel(rawFile.path, cfg.output);
+        processedFiles.push(await fileProcessWorker({ rawFile, config: cfg, level }));
       }
       return processedFiles;
     },
@@ -73,10 +62,7 @@ const runPack = (rootDirs: string[], config: RepomixConfigMerged) =>
         filterOutUntrustedFiles,
       }),
     produceOutput,
-    createMetricsTaskRunner: () => ({
-      taskRunner: { run: async () => 0, cleanup: async () => {} },
-      warmupPromise: Promise.resolve(),
-    }),
+    createMetricsTaskRunner: createMetricsTaskRunnerDouble().createMetricsTaskRunner,
     calculateMetrics: async (processedFiles) => ({
       totalFiles: processedFiles.length,
       totalCharacters: processedFiles.reduce((acc, f) => acc + f.content.length, 0),
@@ -100,6 +86,8 @@ const countOccurrences = (haystack: string, needle: string): number => {
   return count;
 };
 
+const toDisplayPath = (filePath: string): string => filePath.replaceAll(path.win32.sep, path.posix.sep);
+
 describe('multi-root pack spec', () => {
   let rootAParent: string;
   let rootBParent: string;
@@ -109,11 +97,11 @@ describe('multi-root pack spec', () => {
   let outputPath: string;
 
   beforeEach(async () => {
-    rootAParent = await fs.mkdtemp(path.join(os.tmpdir(), 'repomix-multiroot-parent-a-'));
-    rootBParent = await fs.mkdtemp(path.join(os.tmpdir(), 'repomix-multiroot-parent-b-'));
+    rootAParent = await createTempDir('repomix-multiroot-parent-a-');
+    rootBParent = await createTempDir('repomix-multiroot-parent-b-');
     rootA = path.join(rootAParent, 'app');
     rootB = path.join(rootBParent, 'app');
-    outputDir = await fs.mkdtemp(path.join(os.tmpdir(), 'repomix-multiroot-out-'));
+    outputDir = await createTempDir('repomix-multiroot-out-');
     outputPath = path.join(outputDir, 'output.xml');
 
     // Same root basename and same relative paths, but unique content so a
@@ -129,14 +117,8 @@ describe('multi-root pack spec', () => {
     await fs.writeFile(path.join(rootB, 'src', 'index.ts'), 'export const fromB = "ROOT_B_SRC_MARKER";\n');
   });
 
-  afterEach(async () => {
-    await fs.rm(rootAParent, { recursive: true, force: true });
-    await fs.rm(rootBParent, { recursive: true, force: true });
-    await fs.rm(outputDir, { recursive: true, force: true });
-  });
-
   it('preserves both unique contents of a duplicate relative path when packing multiple roots (xml)', async () => {
-    const config = buildMergedConfig(outputDir, outputPath, 'xml');
+    const config = buildPackSpecConfig(outputDir, outputPath, 'xml');
     await runPack([rootA, rootB], config);
 
     const output = await fs.readFile(outputPath, 'utf-8');
@@ -153,7 +135,7 @@ describe('multi-root pack spec', () => {
     // Plain style takes a different rendering path; the assertion is
     // style-agnostic because the collapse, if reintroduced, would surface
     // identically in both.
-    const config = buildMergedConfig(outputDir, outputPath, 'plain');
+    const config = buildPackSpecConfig(outputDir, outputPath, 'plain');
     await runPack([rootA, rootB], config);
 
     const output = await fs.readFile(outputPath, 'utf-8');
@@ -161,23 +143,22 @@ describe('multi-root pack spec', () => {
     expect(output).toContain('MARKER_FROM_ROOT_B');
   });
 
-  it.each([
-    'xml',
-    'markdown',
-    'plain',
-  ] as const)('packs each duplicate-relative-path multi-root file exactly once in %s style', async (style) => {
-    const config = buildMergedConfig(outputDir, outputPath, style);
-    await runPack([rootA, rootB], config);
+  it.each(['xml', 'markdown', 'plain'] as const)(
+    'packs each duplicate-relative-path multi-root file exactly once in %s style',
+    async (style) => {
+      const config = buildPackSpecConfig(outputDir, outputPath, style);
+      await runPack([rootA, rootB], config);
 
-    const output = await fs.readFile(outputPath, 'utf-8');
-    expect(countOccurrences(output, 'MARKER_FROM_ROOT_A')).toBe(1);
-    expect(countOccurrences(output, 'MARKER_FROM_ROOT_B')).toBe(1);
-    expect(countOccurrences(output, 'ROOT_A_SRC_MARKER')).toBe(1);
-    expect(countOccurrences(output, 'ROOT_B_SRC_MARKER')).toBe(1);
-  });
+      const output = await fs.readFile(outputPath, 'utf-8');
+      expect(countOccurrences(output, 'MARKER_FROM_ROOT_A')).toBe(1);
+      expect(countOccurrences(output, 'MARKER_FROM_ROOT_B')).toBe(1);
+      expect(countOccurrences(output, 'ROOT_A_SRC_MARKER')).toBe(1);
+      expect(countOccurrences(output, 'ROOT_B_SRC_MARKER')).toBe(1);
+    },
+  );
 
   it('preserves duplicate relative paths in json output with unique keys', async () => {
-    const config = buildMergedConfig(outputDir, outputPath, 'json');
+    const config = buildPackSpecConfig(outputDir, outputPath, 'json');
     await runPack([rootA, rootB], config);
 
     const output = await fs.readFile(outputPath, 'utf-8');
@@ -197,8 +178,49 @@ describe('multi-root pack spec', () => {
     expect(parsed.files['app-2/src/index.ts']).toContain('ROOT_B_SRC_MARKER');
   });
 
+  it('uses cwd-relative file paths in xml output when requested', async () => {
+    const config = buildPackSpecConfig(outputDir, outputPath, 'xml', {
+      output: { filePathStyle: 'cwd-relative' },
+    });
+    await runPack([rootA], config);
+
+    const output = await fs.readFile(outputPath, 'utf-8');
+    const expectedReadmePath = toDisplayPath(path.relative(outputDir, path.join(rootA, 'README.md')));
+    const expectedSrcPath = toDisplayPath(path.relative(outputDir, path.join(rootA, 'src', 'index.ts')));
+
+    expect(output).toContain(`<file path="${expectedReadmePath}">`);
+    expect(output).toContain(`<file path="${expectedSrcPath}">`);
+    expect(output).not.toContain('<file path="README.md">');
+    expect(output).not.toContain('<file path="src/index.ts">');
+  });
+
+  it('uses cwd-relative file keys in json output for multiple roots when requested', async () => {
+    const config = buildPackSpecConfig(outputDir, outputPath, 'json', {
+      output: { filePathStyle: 'cwd-relative' },
+    });
+    await runPack([rootA, rootB], config);
+
+    const output = await fs.readFile(outputPath, 'utf-8');
+    const parsed = JSON.parse(output) as { files: Record<string, string> };
+
+    const expectedKeys = [
+      path.join(rootA, 'README.md'),
+      path.join(rootA, 'src', 'index.ts'),
+      path.join(rootB, 'README.md'),
+      path.join(rootB, 'src', 'index.ts'),
+    ].map((filePath) => toDisplayPath(path.relative(outputDir, filePath)));
+
+    expect(Object.keys(parsed.files).sort()).toEqual(expectedKeys.sort());
+    expect(parsed.files[toDisplayPath(path.relative(outputDir, path.join(rootA, 'README.md')))]).toContain(
+      'MARKER_FROM_ROOT_A',
+    );
+    expect(parsed.files[toDisplayPath(path.relative(outputDir, path.join(rootB, 'README.md')))]).toContain(
+      'MARKER_FROM_ROOT_B',
+    );
+  });
+
   it('reports the real file count for duplicate-relative-path multi-root inputs', async () => {
-    const config = buildMergedConfig(outputDir, outputPath, 'xml');
+    const config = buildPackSpecConfig(outputDir, outputPath, 'xml');
     const result = await runPack([rootA, rootB], config);
 
     expect(result.totalFiles).toBe(4);

@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { searchFiles } from '../../../src/core/file/fileSearch.js';
+import { createTempDir } from '../../testing/tempDir.js';
 import { createMockConfig, writeFixture } from '../../testing/testUtils.js';
 
 // Behavior-level regression tests for gitignore handling.
@@ -27,11 +27,7 @@ describe('fileSearch gitignore spec', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'repomix-gitignore-spec-'));
-  });
-
-  afterEach(async () => {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    tmpDir = await createTempDir('repomix-gitignore-spec-');
   });
 
   // Mirrors git's own negation semantics: a file may be re-included if its
@@ -61,28 +57,31 @@ describe('fileSearch gitignore spec', () => {
     // globby loads the rules, and the post-filter (sharing the same normalization)
     // still removes the file rather than leaking it.
     '**/.gitignore/',
-  ])('still applies nested .gitignore rules when the nested .gitignore file itself is ignored by `%s`', async (ignorePattern) => {
-    await writeFixture(tmpDir, {
-      'browser/.gitignore': '*.draft\n',
-      'browser/src/index.ts': 'export {};\n',
-      'browser/noisy.draft': 'noisy\n',
-    });
+  ])(
+    'still applies nested .gitignore rules when the nested .gitignore file itself is ignored by `%s`',
+    async (ignorePattern) => {
+      await writeFixture(tmpDir, {
+        'browser/.gitignore': '*.draft\n',
+        'browser/src/index.ts': 'export {};\n',
+        'browser/noisy.draft': 'noisy\n',
+      });
 
-    const { filePaths } = await searchFiles(
-      tmpDir,
-      createMockConfig({
-        include: ['browser/**'],
-        ignore: {
-          useDefaultPatterns: false,
-          customPatterns: [ignorePattern],
-        },
-      }),
-    );
+      const { filePaths } = await searchFiles(
+        tmpDir,
+        createMockConfig({
+          include: ['browser/**'],
+          ignore: {
+            useDefaultPatterns: false,
+            customPatterns: [ignorePattern],
+          },
+        }),
+      );
 
-    expect(filePaths).toContain('browser/src/index.ts');
-    expect(filePaths).not.toContain('browser/.gitignore');
-    expect(filePaths).not.toContain('browser/noisy.draft');
-  });
+      expect(filePaths).toContain('browser/src/index.ts');
+      expect(filePaths).not.toContain('browser/.gitignore');
+      expect(filePaths).not.toContain('browser/noisy.draft');
+    },
+  );
 
   it('filters root and nested .gitignore files matched by `**/.gitignore` while still applying their rules', async () => {
     await writeFixture(tmpDir, {
@@ -164,11 +163,38 @@ describe('fileSearch gitignore spec', () => {
     expect(filePaths).toContain('sub/keep.ts');
   });
 
-  // Note: parent-directory .gitignore handling when `searchFiles` is invoked
-  // against a subdirectory is intentionally NOT covered here. globby reads
-  // .gitignore files within `cwd` only, so this is a pre-existing gap on main
-  // rather than a regression target. Capture it as a real spec the day the
-  // codebase commits to that behavior.
+  it('honors a parent .gitignore when searching a directory input', async () => {
+    // globby only walks parent .gitignore files up to a git root, so the
+    // fixture needs a `.git` directory to be one.
+    await fs.mkdir(path.join(tmpDir, '.git'));
+    await writeFixture(tmpDir, {
+      '.gitignore': 'should_ignore1.py\nsrc/should_ignore2.py\n',
+      'src/valid.py': 'valid = true;\n',
+      'src/should_ignore1.py': 'ignored = 1;\n',
+      'src/should_ignore2.py': 'ignored = 2;\n',
+    });
+
+    const directoryResult = await searchFiles(path.join(tmpDir, 'src'), createMockConfig({ cwd: tmpDir }));
+    // Packing the root with an include filter must agree with packing the subdirectory.
+    const includeResult = await searchFiles(tmpDir, createMockConfig({ cwd: tmpDir, include: ['src/**'] }));
+
+    expect(directoryResult.filePaths).toEqual(['valid.py']);
+    expect(includeResult.filePaths).toEqual(['src/valid.py']);
+  });
+
+  it('does not apply a parent .gitignore outside a git repository', async () => {
+    // Git applies no .gitignore outside a repository, and neither does globby's
+    // parent walk.
+    await writeFixture(tmpDir, {
+      '.gitignore': 'should_ignore1.py\n',
+      'src/valid.py': 'valid = true;\n',
+      'src/should_ignore1.py': 'ignored = 1;\n',
+    });
+
+    const { filePaths } = await searchFiles(path.join(tmpDir, 'src'), createMockConfig({ cwd: tmpDir }));
+
+    expect(filePaths).toEqual(['should_ignore1.py', 'valid.py']);
+  });
 
   it('reads .gitignore inside monorepo `packages/*` (the classic Lerna/pnpm layout)', async () => {
     await writeFixture(tmpDir, {

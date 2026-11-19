@@ -4,8 +4,10 @@ import { logger } from '../shared/logger.js';
 import { logMemoryUsage, withMemoryLogging } from '../shared/memoryUtils.js';
 import type { RepomixProgressCallback } from '../shared/types.js';
 import { collectFiles, type SkippedFileInfo } from './file/fileCollect.js';
+import { resolveFileLevel } from './file/fileLevelResolve.js';
 import { sortPaths } from './file/filePathSort.js';
 import { processFiles } from './file/fileProcess.js';
+import { applyFileProcessors } from './file/fileProcessorRun.js';
 import { searchFiles } from './file/fileSearch.js';
 import type { FilesByRoot } from './file/fileTreeGenerate.js';
 import type { ProcessedFile } from './file/fileTypes.js';
@@ -15,7 +17,7 @@ import { calculateMetrics, createMetricsTaskRunner } from './metrics/calculateMe
 import { loadTokenCountCache, saveTokenCountCache } from './metrics/tokenCountCache.js';
 import { prefetchSortData, sortOutputFiles } from './output/outputSort.js';
 import { produceOutput } from './packager/produceOutput.js';
-import { buildRootLabels, joinDisplayPath } from './packager/rootDisplayPath.js';
+import { buildFileDisplayPath, buildRootLabels, usesRootLabels } from './packager/rootDisplayPath.js';
 import type { SuspiciousFileResult } from './security/securityCheck.js';
 import { validateFileSafety } from './security/validateFileSafety.js';
 import type { PackSkillParams } from './skill/packSkill.js';
@@ -40,6 +42,7 @@ export interface PackResult {
 const defaultDeps = {
   searchFiles,
   collectFiles,
+  applyFileProcessors,
   processFiles,
   validateFileSafety,
   produceOutput,
@@ -64,6 +67,13 @@ export interface PackOptions {
   skillDir?: string;
   skillProjectName?: string;
   skillSourceUrl?: string;
+  // Drop any discovered file that resolves outside its base dir (untrusted-agent
+  // callers like the MCP --sandbox). Off by default so ../ / absolute include
+  // patterns keep working for normal CLI and library callers.
+  confineToBaseDir?: boolean;
+  // Cancels the pack (e.g. an MCP client cancelling the tool call). Checked between
+  // phases; worker pools are destroyed as soon as it fires.
+  signal?: AbortSignal;
 }
 
 export const pack = async (
@@ -78,6 +88,8 @@ export const pack = async (
     ...defaultDeps,
     ...overrideDeps,
   };
+  const { signal } = options;
+  signal?.throwIfAborted();
 
   logMemoryUsage('Pack - Start');
 
@@ -97,16 +109,36 @@ export const pack = async (
   const searchResultsByDir = await withMemoryLogging('Search Files', async () =>
     Promise.all(
       rootDirs.map(async (rootDir) => {
-        const result = await deps.searchFiles(rootDir, config, explicitFiles);
+        const result = await deps.searchFiles(rootDir, config, explicitFiles, options.confineToBaseDir);
         return { rootDir, filePaths: result.filePaths, emptyDirPaths: result.emptyDirPaths };
       }),
     ),
   );
+  signal?.throwIfAborted();
+
+  const filePathStyle = config.output.filePathStyle;
+  const rootLabels =
+    usesRootLabels(filePathStyle) && rootDirs.length > 1 ? buildRootLabels(rootDirs, config.cwd) : undefined;
 
   // Deduplicate and sort empty directory paths for reuse during output generation,
   // avoiding a redundant searchFiles call in buildOutputGeneratorContext.
   const emptyDirPaths = config.output.includeEmptyDirectories
-    ? [...new Set(searchResultsByDir.flatMap((r) => r.emptyDirPaths))].sort()
+    ? [
+        ...new Set(
+          searchResultsByDir.flatMap(({ rootDir, emptyDirPaths }, index) => {
+            const rootLabel = rootLabels?.[index];
+            return emptyDirPaths.map((emptyDirPath) =>
+              buildFileDisplayPath({
+                rootDir,
+                filePath: emptyDirPath,
+                cwd: config.cwd,
+                filePathStyle,
+                rootLabel,
+              }),
+            );
+          }),
+        ),
+      ].sort()
     : undefined;
 
   // Sort file paths
@@ -115,12 +147,19 @@ export const pack = async (
     rootDir,
     filePaths: deps.sortPaths([...new Set(filePaths)]),
   }));
-  const rootLabels = rootDirs.length > 1 ? buildRootLabels(rootDirs, config.cwd) : undefined;
   const displayFilePathsByDir = sortedFilePathsByDir.map(({ rootDir, filePaths }, index) => {
     const rootLabel = rootLabels?.[index];
     return {
       rootDir,
-      filePaths: rootLabel ? filePaths.map((filePath) => joinDisplayPath(rootLabel, filePath)) : filePaths,
+      filePaths: filePaths.map((filePath) =>
+        buildFileDisplayPath({
+          rootDir,
+          filePath,
+          cwd: config.cwd,
+          filePathStyle,
+          rootLabel,
+        }),
+      ),
     };
   });
   const allFilePaths = displayFilePathsByDir.flatMap(({ filePaths }) => filePaths);
@@ -132,7 +171,9 @@ export const pack = async (
     rootDirs,
     allFilePaths.length,
     config.tokenCount.encoding,
+    signal,
   );
+  let pendingOutput: Promise<unknown> | undefined;
 
   try {
     // Run file collection and git operations in parallel since they are independent:
@@ -145,27 +186,56 @@ export const pack = async (
         'Collect Files',
         async () =>
           await Promise.all(
-            sortedFilePathsByDir.map(({ rootDir, filePaths }) =>
-              deps.collectFiles(filePaths, rootDir, config, progressCallback),
-            ),
+            sortedFilePathsByDir.map(async ({ rootDir, filePaths }) => {
+              const collected = await deps.collectFiles(filePaths, rootDir, config, progressCallback);
+              // Apply file processors per root while paths are still per-root-relative
+              // (the same basis include/ignore/output.patterns match against), before
+              // paths are rewritten to their display form below. Transformed content
+              // then flows through the security check and metrics like any other file.
+              const rawFiles = await deps.applyFileProcessors(collected.rawFiles, rootDir, config, progressCallback);
+              return { ...collected, rawFiles };
+            }),
           ),
       ),
       deps.getGitDiffs(rootDirs, config),
       deps.getGitLogs(rootDirs, config),
     ]);
+    signal?.throwIfAborted();
 
     const rawFiles = collectResults.flatMap((curr, index) => {
+      const rootDir = sortedFilePathsByDir[index]?.rootDir;
+      if (!rootDir) return [];
       const rootLabel = rootLabels?.[index];
       return curr.rawFiles.map((file) => ({
         ...file,
-        path: rootLabel ? joinDisplayPath(rootLabel, file.path) : file.path,
+        // Resolve the inclusion level against the per-root-relative path (the same
+        // basis include/ignore match against), before `path` is rewritten to its
+        // display form below. Carrying it on the file means output.patterns globs
+        // match per-root regardless of root labels or output.filePathStyle, instead
+        // of being matched against the rewritten display path inside processFiles.
+        level: resolveFileLevel(file.path, config.output),
+        path: buildFileDisplayPath({
+          rootDir,
+          filePath: file.path,
+          cwd: config.cwd,
+          filePathStyle,
+          rootLabel,
+        }),
       }));
     });
     const allSkippedFiles = collectResults.flatMap((curr, index) => {
+      const rootDir = sortedFilePathsByDir[index]?.rootDir;
+      if (!rootDir) return [];
       const rootLabel = rootLabels?.[index];
       return curr.skippedFiles.map((file) => ({
         ...file,
-        path: rootLabel ? joinDisplayPath(rootLabel, file.path) : file.path,
+        path: buildFileDisplayPath({
+          rootDir,
+          filePath: file.path,
+          cwd: config.cwd,
+          filePathStyle,
+          rootLabel,
+        }),
       }));
     });
 
@@ -175,11 +245,11 @@ export const pack = async (
     // After both complete, filter out any suspicious files from the processed results.
     const [validationResult, allProcessedFiles] = await Promise.all([
       withMemoryLogging('Security Check', () =>
-        deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult),
+        deps.validateFileSafety(rawFiles, progressCallback, config, gitDiffResult, gitLogResult, undefined, signal),
       ),
       withMemoryLogging('Process Files', () => {
         progressCallback('Processing files...');
-        return deps.processFiles(rawFiles, config, progressCallback);
+        return deps.processFiles(rawFiles, config, progressCallback, undefined, signal);
       }),
     ]);
 
@@ -199,8 +269,17 @@ export const pack = async (
     // in order via `extractOutputWrapper`.
     await sortDataPromise;
     const processedFiles = await deps.sortOutputFiles(filteredProcessedFiles, config);
+    signal?.throwIfAborted();
 
     progressCallback('Generating output...');
+
+    // Build filePathsByRoot for multi-root tree generation
+    const filePathsByRoot: FilesByRoot[] | undefined = usesRootLabels(filePathStyle)
+      ? sortedFilePathsByDir.map(({ rootDir, filePaths }, index) => ({
+          rootLabel: rootLabels?.[index] ?? (path.basename(rootDir) || rootDir),
+          files: filePaths,
+        }))
+      : undefined;
 
     // Skill generation path — metrics not needed, return early (worker pool cleaned up by finally)
     if (config.skillGenerate !== undefined && options.skillDir) {
@@ -218,17 +297,13 @@ export const pack = async (
         safeFilePaths,
         skippedFiles: allSkippedFiles,
         progressCallback,
+        filePathsByRoot,
       });
+      signal?.throwIfAborted();
 
       logMemoryUsage('Pack - End');
       return result;
     }
-
-    // Build filePathsByRoot for multi-root tree generation
-    const filePathsByRoot: FilesByRoot[] = sortedFilePathsByDir.map(({ rootDir, filePaths }, index) => ({
-      rootLabel: rootLabels?.[index] ?? (path.basename(rootDir) || rootDir),
-      files: filePaths,
-    }));
 
     // Ensure warm-up task completes before metrics calculation
     await metricsWarmupPromise;
@@ -236,6 +311,7 @@ export const pack = async (
     // from it. The load was started at the very beginning of pack() and is
     // typically already resolved; this await is a safety net for fast machines.
     await tokenCacheLoadPromise;
+    signal?.throwIfAborted();
 
     // Generate and write output, overlapping with metrics calculation.
     // File and git metrics don't depend on the output, so they start immediately
@@ -252,6 +328,7 @@ export const pack = async (
       emptyDirPaths,
     );
 
+    pendingOutput = outputPromise;
     const outputForMetricsPromise = outputPromise.then((r) => r.outputForMetrics);
 
     const [{ outputFiles }, metrics] = await Promise.all([
@@ -270,6 +347,7 @@ export const pack = async (
         ),
       ),
     ]);
+    signal?.throwIfAborted();
 
     // Create a result object that includes metrics and security results
     const result = {
@@ -291,7 +369,15 @@ export const pack = async (
     logMemoryUsage('Pack - End');
 
     return result;
+  } catch (error) {
+    // An aborted pack surfaces the abort reason rather than whichever error the
+    // destroyed worker pool produced.
+    signal?.throwIfAborted();
+    throw error;
   } finally {
+    // Let an in-flight output write settle so it cannot land after the caller has
+    // already cleaned up the output directory.
+    await pendingOutput?.catch(() => {});
     await metricsWarmupPromise.catch(() => {});
     await metricsTaskRunner.cleanup();
   }
